@@ -1,0 +1,13 @@
+* Inbox
+** TODO Start rendering system (OpenGL? Vulkan?)
+*** TODO Understand shaders
+*** TODO Research graphics pipeline
+*** TODO Research Vulkan vs OpenGL as my first renderer experience
+
+** TODO input system (linux only)
+
+** TODO Start implementing a resource manager
+
+*** TODO Research resource manager functionality
+
+** TODO Finish package system
