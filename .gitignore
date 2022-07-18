@@ -7,3 +7,4 @@ tmp/
 
 zig-cache
 zig-out
+*.zig#
