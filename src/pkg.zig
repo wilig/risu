@@ -59,7 +59,7 @@ const FileSlice = struct {
 
     pub fn read(self: *Self, dest: []u8) File.ReadError!usize {
         self.file.seekTo(self.startOffset + self.currentOffset) catch |err| {
-            log.err("Failed to seek to proper offset during constrainted read, error was {}\n", .{err});
+            log.err("Failed to seek to proper offset during constrainted read, error was {}", .{err});
             return error.InputOutput;
         };
         const max_read = std.math.min(self.len - self.currentOffset, dest.len);
@@ -77,27 +77,32 @@ const FileSlice = struct {
     }
 };
 
-const Package = struct {
+pub const Package = struct {
     const Self = @This();
 
     allocator: std.mem.Allocator,
     entries: std.StringArrayHashMap(TocEntry),
+    path: []const u8,
     file: fs.File,
     toc_offset: u64 = 0,
     reserved: [Reserved.len]u8 = Reserved,
 
     pub fn init(allocator: std.mem.Allocator, path: []const u8) !Self {
-        var file: fs.File = undefined;
-        file = openAndValidateFile(path) catch |err| switch (err) {
+        var file: File = undefined;
+        file = openFile(path, .read_write) catch |err| switch (err) {
             std.fs.File.OpenError.FileNotFound => try createEmptyPackage(path),
             else => {
-                log.err("Failed to open package file, error was {}\n", .{err});
+                log.err("Failed to open package file, error was {}", .{err});
                 return err;
             },
         };
+        if (!try isValidPackage(file)) {
+            return error.InvalidPackage;
+        }
         var pkg = Self{
             .allocator = allocator,
             .file = file,
+            .path = path,
             .entries = std.StringArrayHashMap(TocEntry).init(allocator),
         };
         try pkg.loadTableOfContents();
@@ -120,19 +125,19 @@ const Package = struct {
         }
     }
 
-    fn openAndValidateFile(path: []const u8) !fs.File {
+    fn isValidPackage(file: fs.File) !bool {
         var buffer: [FileMagic.len + Version.len]u8 = std.mem.zeroes([FileMagic.len + Version.len]u8);
-        const file = try openFile(path, .read_write);
+        try file.seekTo(0);
         _ = try file.readAll(&buffer);
         if (!std.mem.eql(u8, buffer[0..FileMagic.len], FileMagic)) {
-            log.err("File is not in package format.\n", .{});
-            return error.InvalidFormat;
+            log.err("File is not in package format.", .{});
+            return false;
         }
         if (!std.mem.eql(u8, buffer[FileMagic.len..], Version)) {
-            log.err("Package version mismatch.  Expected {s}, recieved {s}\n", .{ Version, buffer[FileMagic.len..] });
-            return error.VersionMismatch;
+            log.err("Package version mismatch.  Expected {s}, recieved {s}", .{ Version, buffer[FileMagic.len..] });
+            return false;
         }
-        return file;
+        return true;
     }
 
     fn offsetToData() u64 {
@@ -146,55 +151,89 @@ const Package = struct {
         return FileMagic.len + Version.len;
     }
 
-    // TODO: Don't read the whole file into memory, stream it to the package.
     pub fn add(self: *Self, path: []const u8) !void {
         if (self.entries.contains(path)) {
             return error.DuplicateEntry;
         }
         var f = openFile(path, .read_only) catch |err| {
-            log.err("Couldn't open file {s} error was {}\n", .{ path, err });
+            log.err("Couldn't open file {s} error was {}", .{ path, err });
             return err;
         };
         const file_size = f.getEndPos() catch |err| {
-            log.err("Failed to get file size, error was {}\n", .{err});
+            log.err("Failed to get file size, error was {}", .{err});
             return err;
         };
-        const buffer = self.allocator.alloc(u8, @as(usize, file_size)) catch |err| {
-            log.err("Couldn't allocate enough space to store file data, error was {}\n", .{err});
+        var bytes_copied = fs.File.copyRangeAll(f, 0, self.file, self.toc_offset, try f.getEndPos()) catch |err| {
+            log.err("Failed to copy source file into package, error was: {}", .{err});
             return err;
         };
-        defer self.allocator.free(buffer);
-        var bytes_read = f.readAll(buffer) catch |err| {
-            log.err("Failed to read file data into buffer, error was {}\n", .{err});
-            return err;
-        };
-        if (bytes_read != file_size) {
-            log.err("File size mismatch!  Read {} of {} bytes.\n", .{ bytes_read, file_size });
+        if (bytes_copied != file_size) {
+            log.err("File size mismatch!  Read {} of {} bytes", .{ bytes_copied, file_size });
             return error.ReadMismatch;
         }
-        try self.file.seekTo(offsetToData());
-        self.file.writeAll(buffer) catch |err| {
-            log.err("Couldn't write {s} to package, error was {}.\n", .{ path, err });
-            return err;
-        };
-        var toc_entry = TocEntry{ .offset = self.toc_offset, .len = bytes_read, .timestamp = std.time.milliTimestamp() };
+        var toc_entry = TocEntry{ .offset = self.toc_offset, .len = bytes_copied, .timestamp = std.time.milliTimestamp() };
         self.putEntry(path, toc_entry) catch |err| {
-            log.err("Failed to add entry to package table of contents, error was {}\n", .{err});
+            log.err("Failed to add entry to package table of contents, error was {}", .{err});
             return err;
         };
-        self.toc_offset += bytes_read;
-        try self.writeTableOfContents();
+        self.toc_offset += bytes_copied;
+        try self.writeTableOfContents(self.file);
     }
 
     pub fn remove(self: *Self, path: []const u8) !void {
-        _ = self;
-        _ = path;
-        // TODO: Remove entry, and rewrite package file.
+        if (!self.entries.contains(path)) {
+            log.err("{s} not found in package", .{path});
+            return error.NotFound;
+        }
+
+        // Create replacement package file with the same name as original.
+        const basename = fs.path.basename(self.path);
+        const dir = fs.path.dirname(self.path);
+        var new_package = try fs.AtomicFile.init(basename, .{}, dir, true);
+        defer new_package.deinit();
+        var new_file = new_package.file;
+
+        // Entry to remove
+        const etr = self.entries.get(path).?;
+
+        // Copy the before chunk
+        var bytes_copied = fs.File.copyRangeAll(self.file, 0, new_file, 0, etr.offset) catch |err| {
+            log.err("Failed to copy partial package file, error was: {}", .{err});
+            return err;
+        };
+        std.debug.assert(bytes_copied == etr.offset);
+
+        // Copy the after chunk
+        bytes_copied = fs.File.copyRangeAll(self.file, etr.offset + etr.len, new_file, etr.offset, self.toc_offset) catch |err| {
+            log.err("Failed to copy partial package file, error was: {}", .{err});
+            return err;
+        };
+        std.debug.assert(bytes_copied == self.toc_offset - etr.len);
+
+        // Update all the entries offsets for entries following the removed one
+        for (self.entries.values) |*entry| {
+            if (entry.offset > etr.offset) {
+                entry.offset = entry.offset - etr.len;
+            }
+        }
+
+        if (!self.entries.swapRemove(path)) {
+            log.err("Failed to remove {s} from the table of contents", .{path});
+            return error.RemovalFailure;
+        }
+
+        self.toc_offset -= etr.len;
+
+        self.writeTableOfContents(new_file);
+        new_package.finish() catch |err| {
+            log.err("Failed to finalize updated package, error was: {}", .{err});
+            return err;
+        };
     }
 
     pub fn getEntry(self: *Self, path: []const u8) !FileSlice {
         if (!self.entries.contains(path)) {
-            log.err("{s} not found in package\n", .{path});
+            log.err("{s} not found in package", .{path});
             return error.NotFound;
         }
         const entry = self.entries.get(path).?;
@@ -228,27 +267,27 @@ const Package = struct {
         return file;
     }
 
-    fn writeTableOfContents(self: *Self) !void {
+    fn writeTableOfContents(self: *Self, file: File) !void {
         const entries: u64 = self.entries.count();
         const toc_entry_size: u64 = @sizeOf(TocEntry);
         var pesky_strings = try std.ArrayListUnmanaged(u8).initCapacity(self.allocator, 1000);
-        try self.file.seekTo(offsetToTocOffset());
-        _ = try self.file.writeAll(&std.mem.toBytes(self.toc_offset));
-        try self.file.seekTo(self.toc_offset);
-        _ = try self.file.writeAll(TocMagic);
-        _ = try self.file.write(&std.mem.toBytes(entries));
-        _ = try self.file.write(&std.mem.toBytes(toc_entry_size));
+        try file.seekTo(offsetToTocOffset());
+        _ = try file.writeAll(&std.mem.toBytes(self.toc_offset));
+        try file.seekTo(self.toc_offset);
+        _ = try file.writeAll(TocMagic);
+        _ = try file.write(&std.mem.toBytes(entries));
+        _ = try file.write(&std.mem.toBytes(toc_entry_size));
 
         for (self.entries.keys()) |toc_name| {
             const toc_entry = std.mem.toBytes(self.entries.get(toc_name).?);
-            _ = try self.file.writeAll(&toc_entry);
+            _ = try file.writeAll(&toc_entry);
             try pesky_strings.appendSlice(self.allocator, toc_name);
             try pesky_strings.append(self.allocator, 0); // Add sentinel value
         }
         const toc_names = pesky_strings.toOwnedSlice(self.allocator);
         defer self.allocator.free(toc_names);
         // Leave of the trailing zero or splitting on load will fail
-        _ = try self.file.writeAll(toc_names[0 .. toc_names.len - 1]);
+        _ = try file.writeAll(toc_names[0 .. toc_names.len - 1]);
     }
 
     fn loadTableOfContents(self: *Self) !void {
@@ -261,14 +300,14 @@ const Package = struct {
         _ = try self.file.readAll(toc_header[0..]);
 
         if (!std.mem.eql(u8, TocMagic, toc_header[0..TocMagic.len])) {
-            log.err("Table of contents magic not found, corrupt file?\n", .{});
+            log.err("Table of contents magic not found, corrupt file?", .{});
             return error.CorruptFile;
         }
 
         var num_of_entries = std.mem.bytesToValue(usize, toc_header[TocMagic.len .. TocMagic.len + @sizeOf(usize)]);
         const toc_size = std.mem.bytesToValue(usize, toc_header[TocMagic.len + @sizeOf(usize) ..]);
         if (toc_size != @sizeOf(TocEntry)) {
-            log.err("Size mismatch for table of content entries, corrupt file?\n", .{});
+            log.err("Size mismatch for table of content entries, corrupt file?", .{});
             return error.CorruptFile;
         }
 
@@ -305,22 +344,22 @@ const Package = struct {
 };
 
 test "Adding a file to a package" {
-    const package = "../my_package.rsu";
-    var my_package = try Package.init(std.testing.allocator, package);
-    try my_package.add("pkg.zig");
-    my_package.deinit();
-    try std.os.unlink(package);
+    const package_file = "../package.rsu";
+    var package = try Package.init(std.testing.allocator, package_file);
+    try package.add("pkg.zig");
+    package.deinit();
+    try std.os.unlink(package_file);
 }
 
 test "Getting stream from a package" {
-    const package = "reading_package.rsu";
+    const package_file = "/tmp/package.rsu";
     const source_file = "pkg.zig";
-    errdefer std.os.unlink(package) catch unreachable;
-    var test_package = try Package.init(std.testing.allocator, package);
+    errdefer std.os.unlink(package_file) catch unreachable;
+    var test_package = try Package.init(std.testing.allocator, package_file);
     try test_package.add(source_file);
     test_package.deinit(); // Force close and flush
 
-    test_package = try Package.init(std.testing.allocator, package);
+    test_package = try Package.init(std.testing.allocator, package_file);
     defer test_package.deinit();
     var data = try test_package.getEntry(source_file);
     var packaged_file = try data.reader().readAllAlloc(std.testing.allocator, try data.getEndPos());
@@ -330,5 +369,22 @@ test "Getting stream from a package" {
     var original_file = try original_fh.reader().readAllAlloc(std.testing.allocator, try original_fh.getEndPos());
     defer std.testing.allocator.free(original_file);
     try std.testing.expect(std.mem.eql(u8, original_file, packaged_file));
-    try std.os.unlink(package);
+    try std.os.unlink(package_file);
+}
+
+test "Fails with invalid file" {
+    const package_file = "pkg.zig";
+    var package = Package.init(std.testing.allocator, package_file);
+    try std.testing.expectError(error.InvalidPackage, package);
+}
+
+test "Fails with invalid file on unsupported version" {
+    const bad_version = "X.X.X";
+    const package_file = "../bad-package.rsu";
+    var file = try fs.cwd().createFile(package_file, .{});
+    _ = try file.write(FileMagic);
+    _ = try file.write(bad_version);
+    file.close();
+
+    try std.testing.expectError(error.InvalidPackage, Package.init(std.testing.allocator, package_file));
 }
