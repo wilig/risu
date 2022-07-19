@@ -117,6 +117,10 @@ pub const Package = struct {
         self.entries.deinit();
     }
 
+    pub fn count(self: *Self) usize {
+        return self.entries.count();
+    }
+
     fn openFile(path: []const u8, mode: fs.File.OpenMode) !fs.File {
         if (fs.path.isAbsolute(path)) {
             return try fs.openFileAbsolute(path, .{ .mode = mode });
@@ -188,8 +192,9 @@ pub const Package = struct {
 
         // Create replacement package file with the same name as original.
         const basename = fs.path.basename(self.path);
-        const dir = fs.path.dirname(self.path);
-        var new_package = try fs.AtomicFile.init(basename, .{}, dir, true);
+        const dir_path = fs.path.dirname(self.path).?;
+        const dir = try fs.cwd().openDir(dir_path, .{});
+        var new_package = try fs.AtomicFile.init(basename, fs.File.default_mode, dir, true);
         defer new_package.deinit();
         var new_file = new_package.file;
 
@@ -204,18 +209,21 @@ pub const Package = struct {
         std.debug.assert(bytes_copied == etr.offset);
 
         // Copy the after chunk
-        bytes_copied = fs.File.copyRangeAll(self.file, etr.offset + etr.len, new_file, etr.offset, self.toc_offset) catch |err| {
+        bytes_copied = fs.File.copyRangeAll(self.file, etr.offset + etr.len, new_file, etr.offset, self.toc_offset - (etr.offset + etr.len)) catch |err| {
             log.err("Failed to copy partial package file, error was: {}", .{err});
             return err;
         };
-        std.debug.assert(bytes_copied == self.toc_offset - etr.len);
+        std.debug.assert(bytes_copied == self.toc_offset - (etr.offset + etr.len));
 
         // Update all the entries offsets for entries following the removed one
-        for (self.entries.values) |*entry| {
+        for (self.entries.values()) |*entry| {
             if (entry.offset > etr.offset) {
                 entry.offset = entry.offset - etr.len;
             }
         }
+
+        const removed_key = self.entries.getKey(path).?;
+        defer self.allocator.free(removed_key);
 
         if (!self.entries.swapRemove(path)) {
             log.err("Failed to remove {s} from the table of contents", .{path});
@@ -224,7 +232,9 @@ pub const Package = struct {
 
         self.toc_offset -= etr.len;
 
-        self.writeTableOfContents(new_file);
+        self.writeTableOfContents(new_file) catch |err| {
+            log.err("Failed to write new table of contents, error was: {}", .{err});
+        };
         new_package.finish() catch |err| {
             log.err("Failed to finalize updated package, error was: {}", .{err});
             return err;
@@ -241,6 +251,7 @@ pub const Package = struct {
     }
 
     fn putEntry(self: *Self, path: []const u8, entry: TocEntry) !void {
+        // TODO:  This seems wrong, need to remove this copy operation.
         const toc_key: []u8 = try self.allocator.alloc(u8, path.len);
         std.mem.copy(u8, toc_key, path);
         try self.entries.put(toc_key, entry);
@@ -345,16 +356,16 @@ pub const Package = struct {
 
 test "Adding a file to a package" {
     const package_file = "../package.rsu";
+    defer std.os.unlink(package_file) catch unreachable;
     var package = try Package.init(std.testing.allocator, package_file);
     try package.add("pkg.zig");
     package.deinit();
-    try std.os.unlink(package_file);
 }
 
 test "Getting stream from a package" {
     const package_file = "/tmp/package.rsu";
     const source_file = "pkg.zig";
-    errdefer std.os.unlink(package_file) catch unreachable;
+    defer std.os.unlink(package_file) catch unreachable;
     var test_package = try Package.init(std.testing.allocator, package_file);
     try test_package.add(source_file);
     test_package.deinit(); // Force close and flush
@@ -369,7 +380,88 @@ test "Getting stream from a package" {
     var original_file = try original_fh.reader().readAllAlloc(std.testing.allocator, try original_fh.getEndPos());
     defer std.testing.allocator.free(original_file);
     try std.testing.expect(std.mem.eql(u8, original_file, packaged_file));
-    try std.os.unlink(package_file);
+}
+
+test "Adding multiple files to a package" {
+    const package_file = "/tmp/package.rsu";
+    const source_files = [_][]const u8{ "pkg.zig", "log.zig", "main.zig" };
+    defer std.os.unlink(package_file) catch unreachable;
+    var test_package = try Package.init(std.testing.allocator, package_file);
+    for (source_files) |src_file| {
+        try test_package.add(src_file);
+    }
+    test_package.deinit(); // Force close and flush
+
+    test_package = try Package.init(std.testing.allocator, package_file);
+    defer test_package.deinit();
+    try std.testing.expectEqual(@as(usize, 3), test_package.count());
+    for (source_files) |src_file| {
+        var data = try test_package.getEntry(src_file);
+        var packaged_file = try data.reader().readAllAlloc(std.testing.allocator, try data.getEndPos());
+
+        var original_fh = try fs.cwd().openFile(src_file, .{});
+        var original_file = try original_fh.reader().readAllAlloc(std.testing.allocator, try original_fh.getEndPos());
+
+        try std.testing.expect(std.mem.eql(u8, original_file, packaged_file));
+
+        original_fh.close();
+        std.testing.allocator.free(original_file);
+        std.testing.allocator.free(packaged_file);
+    }
+}
+
+test "Adding multiple files to a package over time" {
+    const package_file = "/tmp/package.rsu";
+    var source_files = [_][]const u8{ "pkg.zig", "log.zig" };
+    defer std.os.unlink(package_file) catch unreachable;
+    var test_package = try Package.init(std.testing.allocator, package_file);
+    for (source_files) |src_file| {
+        try test_package.add(src_file);
+    }
+    test_package.deinit(); // Force close and flush
+
+    source_files = [_][]const u8{ "main.zig", "net/udp.zig" };
+    test_package = try Package.init(std.testing.allocator, package_file);
+    for (source_files) |src_file| {
+        try test_package.add(src_file);
+    }
+    test_package.deinit();
+
+    test_package = try Package.init(std.testing.allocator, package_file);
+    defer test_package.deinit();
+    try std.testing.expectEqual(@as(usize, 4), test_package.count());
+}
+
+test "Removing a file from a package" {
+    const package_file = "/tmp/package.rsu";
+    const source_files = [_][]const u8{ "pkg.zig", "log.zig", "main.zig" };
+    defer std.os.unlink(package_file) catch unreachable;
+    var test_package = try Package.init(std.testing.allocator, package_file);
+    for (source_files) |src_file| {
+        try test_package.add(src_file);
+    }
+    test_package.deinit(); // Force close and flush
+
+    test_package = try Package.init(std.testing.allocator, package_file);
+    try test_package.remove(source_files[0]);
+    test_package.deinit();
+
+    test_package = try Package.init(std.testing.allocator, package_file);
+    defer test_package.deinit();
+    try std.testing.expectEqual(@as(usize, 2), test_package.count());
+    for (source_files[1..]) |src_file| {
+        var data = try test_package.getEntry(src_file);
+        var packaged_file = try data.reader().readAllAlloc(std.testing.allocator, try data.getEndPos());
+
+        var original_fh = try fs.cwd().openFile(src_file, .{});
+        var original_file = try original_fh.reader().readAllAlloc(std.testing.allocator, try original_fh.getEndPos());
+
+        try std.testing.expect(std.mem.eql(u8, original_file, packaged_file));
+
+        original_fh.close();
+        std.testing.allocator.free(original_file);
+        std.testing.allocator.free(packaged_file);
+    }
 }
 
 test "Fails with invalid file" {
